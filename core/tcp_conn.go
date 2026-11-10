@@ -66,8 +66,12 @@ type tcpConn struct {
 	connKey       uint32
 	canWrite      *sync.Cond // Condition variable to implement TCP backpressure.
 	state         tcpConnState
-	sndPipeReader *io.PipeReader
-	sndPipeWriter *io.PipeWriter
+	receiveMu     sync.Mutex
+	canRead       *sync.Cond
+	receiveBuffer []byte
+	receiveHead   int
+	receiveSize   int
+	receiveErr    error
 	closeOnce     sync.Once
 	closeErr      error
 }
@@ -86,19 +90,18 @@ func newTCPConn(pcb *C.struct_tcp_pcb, handler TCPConnHandler) (TCPConn, error) 
 	setTCPErrCallback(pcb)
 	setTCPPollCallback(pcb, C.u8_t(TCP_POLL_INTERVAL))
 
-	pipeReader, pipeWriter := io.Pipe()
 	conn := &tcpConn{
-		pcb:           pcb,
-		handler:       handler,
-		localAddr:     ParseTCPAddr(ipAddrNTOA(pcb.remote_ip), uint16(pcb.remote_port)),
-		remoteAddr:    ParseTCPAddr(ipAddrNTOA(pcb.local_ip), uint16(pcb.local_port)),
-		connKeyArg:    connKeyArg,
-		connKey:       connKey,
-		canWrite:      sync.NewCond(&sync.Mutex{}),
-		state:         tcpNewConn,
-		sndPipeReader: pipeReader,
-		sndPipeWriter: pipeWriter,
+		pcb:        pcb,
+		handler:    handler,
+		localAddr:  ParseTCPAddr(ipAddrNTOA(pcb.remote_ip), uint16(pcb.remote_port)),
+		remoteAddr: ParseTCPAddr(ipAddrNTOA(pcb.local_ip), uint16(pcb.local_port)),
+		connKeyArg: connKeyArg,
+		connKey:    connKey,
+		canWrite:   sync.NewCond(&sync.Mutex{}),
+		state:      tcpNewConn,
 	}
+
+	conn.canRead = sync.NewCond(&conn.receiveMu)
 
 	// Associate conn with key and save to the global map.
 	tcpConns.Store(connKey, conn)
@@ -120,12 +123,6 @@ func newTCPConn(pcb *C.struct_tcp_pcb, handler TCPConnHandler) (TCPConn, error) 
 			}
 			conn.state = tcpConnected
 			conn.Unlock()
-
-			lwipMutex.Lock()
-			if pcb.refused_data != nil {
-				C.tcp_process_refused_data(pcb)
-			}
-			lwipMutex.Unlock()
 		}
 	}()
 
@@ -155,14 +152,14 @@ func (conn *tcpConn) receiveCheck() error {
 	defer conn.Unlock()
 
 	switch conn.state {
+	case tcpNewConn:
+		fallthrough
+	case tcpConnecting:
+		fallthrough
 	case tcpConnected:
 		fallthrough
 	case tcpWriteClosed:
 		return nil
-	case tcpNewConn:
-		fallthrough
-	case tcpConnecting:
-		return NewLWIPError(LWIP_ERR_CONN)
 	case tcpAborting:
 		fallthrough
 	case tcpClosed:
@@ -172,44 +169,88 @@ func (conn *tcpConn) receiveCheck() error {
 	case tcpClosing:
 		return NewLWIPError(LWIP_ERR_CLSD)
 	case tcpErrored:
-		conn.abortInternal()
-		return NewLWIPError(LWIP_ERR_ABRT)
+		return NewLWIPError(LWIP_ERR_CLSD)
 	default:
 		panic("unexpected error")
 	}
-	return nil
 }
 
 func (conn *tcpConn) Receive(data []byte) error {
 	if err := conn.receiveCheck(); err != nil {
 		return err
 	}
-	n, err := conn.sndPipeWriter.Write(data)
-	if err != nil {
+	// Never block the lwIP thread on proxy dialing or socket writes. In particular,
+	// refusing the first segment while dialing makes lwIP drop subsequent segments.
+	// Keep at most the advertised receive window, and reopen it only when Read drains it.
+	conn.receiveMu.Lock()
+	defer conn.receiveMu.Unlock()
+	if conn.receiveErr != nil {
 		return NewLWIPError(LWIP_ERR_CLSD)
 	}
-	C.tcp_recved(conn.pcb, C.u16_t(n))
+	if len(data) > int(C.TCP_WND)-conn.receiveSize {
+		return NewLWIPError(LWIP_ERR_CONN)
+	}
+	if len(data) > 0 {
+		if conn.receiveBuffer == nil {
+			conn.receiveBuffer = make([]byte, int(C.TCP_WND))
+		}
+		tail := (conn.receiveHead + conn.receiveSize) % len(conn.receiveBuffer)
+		n := copy(conn.receiveBuffer[tail:], data)
+		copy(conn.receiveBuffer, data[n:])
+		conn.receiveSize += len(data)
+		conn.canRead.Broadcast()
+	}
 	return NewLWIPError(LWIP_ERR_OK)
 }
 
 func (conn *tcpConn) Read(data []byte) (int, error) {
-	conn.Lock()
-	if conn.state == tcpReceiveClosed {
-		conn.Unlock()
-		return 0, io.EOF
+	if len(data) == 0 {
+		return 0, nil
 	}
-	if conn.state >= tcpClosing {
-		conn.Unlock()
-		return 0, io.ErrClosedPipe
+	conn.receiveMu.Lock()
+	for conn.receiveSize == 0 && conn.receiveErr == nil {
+		conn.canRead.Wait()
 	}
-	conn.Unlock()
+	if conn.receiveSize == 0 {
+		err := conn.receiveErr
+		conn.receiveMu.Unlock()
+		return 0, err
+	}
+	n := len(data)
+	if n > conn.receiveSize {
+		n = conn.receiveSize
+	}
+	first := copy(data[:n], conn.receiveBuffer[conn.receiveHead:])
+	copy(data[first:n], conn.receiveBuffer[:n-first])
+	conn.receiveHead = (conn.receiveHead + n) % len(conn.receiveBuffer)
+	conn.receiveSize -= n
+	conn.receiveMu.Unlock()
 
-	// Handler should get EOF.
-	n, err := conn.sndPipeReader.Read(data)
-	if err == io.ErrClosedPipe {
-		err = io.EOF
+	// Packet callbacks take lwipMutex before conn.Mutex. Release receiveMu first,
+	// and check the state under lwipMutex: a reset may already have freed the PCB.
+	lwipMutex.Lock()
+	conn.Lock()
+	alive := conn.state < tcpAborting
+	conn.Unlock()
+	if alive {
+		C.tcp_recved(conn.pcb, C.u16_t(n))
+		C.tcp_output(conn.pcb)
 	}
-	return n, err
+	lwipMutex.Unlock()
+	return n, nil
+}
+
+func (conn *tcpConn) finishRead(err error, discard bool) {
+	conn.receiveMu.Lock()
+	defer conn.receiveMu.Unlock()
+	if discard {
+		conn.receiveSize = 0
+		conn.receiveBuffer = nil
+	}
+	if conn.receiveErr == nil || discard {
+		conn.receiveErr = err
+	}
+	conn.canRead.Broadcast()
 }
 
 // writeInternal enqueues data to snd_buf, and treats ERR_MEM returned by tcp_write not an error,
@@ -312,7 +353,8 @@ func (conn *tcpConn) CloseWrite() error {
 }
 
 func (conn *tcpConn) CloseRead() error {
-	return conn.sndPipeReader.Close()
+	conn.finishRead(io.ErrClosedPipe, true)
+	return nil
 }
 
 func (conn *tcpConn) Sent(len uint16) error {
@@ -394,8 +436,8 @@ func (conn *tcpConn) setLocalClosed() error {
 		return nil
 	}
 
-	// Causes the read half of the pipe returns.
-	conn.sndPipeWriter.Close()
+	// Deliver buffered bytes before EOF, including a FIN received while dialing.
+	conn.finishRead(io.EOF, false)
 
 	if conn.state == tcpWriteClosed {
 		conn.state = tcpClosing
@@ -428,6 +470,7 @@ func (conn *tcpConn) closeInternal() error {
 // Never call this function outside of the lwIP thread since it calls
 // tcp_abort() and in that case we must return ERR_ABRT to lwIP.
 func (conn *tcpConn) abortInternal() {
+	conn.finishRead(io.ErrClosedPipe, true)
 	conn.release()
 	C.tcp_abort(conn.pcb)
 }
@@ -449,6 +492,7 @@ func (conn *tcpConn) Err(err error) {
 	conn.Lock()
 	defer conn.Unlock()
 
+	conn.finishRead(io.ErrClosedPipe, true)
 	conn.release()
 	conn.state = tcpErrored
 	conn.canWrite.Broadcast()
@@ -464,8 +508,7 @@ func (conn *tcpConn) release() {
 		freeConnKeyArg(conn.connKeyArg)
 		tcpConns.Delete(conn.connKey)
 	}
-	conn.sndPipeWriter.Close()
-	conn.sndPipeReader.Close()
+	conn.finishRead(io.EOF, false)
 	conn.state = tcpClosed
 }
 
