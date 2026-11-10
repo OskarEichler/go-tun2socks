@@ -34,10 +34,8 @@ type TCPConn interface {
 	// LocalAddr returns the local client network address.
 	LocalAddr() net.Addr
 
-	// Read reads data comming from TUN, note that it reads from an
-	// underlying pipe that the writer writes in the lwip thread,
-	// write op blocks until previous written data is consumed, one
-	// should read out all data as soon as possible.
+	// Read reads data coming from TUN. Data is buffered up to the TCP receive
+	// window without blocking the lwIP thread. Reading reopens that window.
 	Read(data []byte) (int, error)
 
 	// Write writes data to TUN.
