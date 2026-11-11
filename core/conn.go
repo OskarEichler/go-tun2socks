@@ -34,8 +34,9 @@ type TCPConn interface {
 	// LocalAddr returns the local client network address.
 	LocalAddr() net.Addr
 
-	// Read reads data coming from TUN. Data is buffered up to the TCP receive
-	// window without blocking the lwIP thread. Reading reopens that window.
+	// Read reads data coming from TUN. When there is no data, Read waits.
+	// lwIP does not wait for the reader: when the receive window fills, TCP
+	// flow control pauses the peer until Read returns window credit.
 	Read(data []byte) (int, error)
 
 	// Write writes data to TUN.

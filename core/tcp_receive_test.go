@@ -30,17 +30,27 @@ type receiveTestPeer struct {
 	output  chan []byte
 	seq     uint32
 	ack     uint32
+	port    uint16
+	window  uint16
 	release func()
 	closed  bool
 }
+
+var receiveTestPort uint16 = 40000
 
 // Drive the actual lwIP callbacks, including refused_data and window accounting.
 // These tests must be serial: the stack and registered callbacks are global.
 func newReceiveTestPeer(t *testing.T, dialErr error) *receiveTestPeer {
 	t.Helper()
+	return newReceiveTestPeerWithWindow(t, dialErr, 32768)
+}
+
+func newReceiveTestPeerWithWindow(t *testing.T, dialErr error, window uint16) *receiveTestPeer {
+	t.Helper()
 	h := &receiveTestHandler{make(chan net.Conn, 1), make(chan struct{}), dialErr}
 	RegisterTCPConnHandler(h)
-	p := &receiveTestPeer{t: t, output: make(chan []byte, 256), seq: 100}
+	receiveTestPort++
+	p := &receiveTestPeer{t: t, output: make(chan []byte, 256), seq: 100, port: receiveTestPort, window: window}
 	RegisterOutputFn(func(b []byte) (int, error) {
 		p.output <- append([]byte(nil), b...)
 		return len(b), nil
@@ -80,12 +90,12 @@ func (p *receiveTestPeer) send(flags byte, data []byte) {
 	copy(b[12:16], []byte{172, 16, 9, 1})
 	copy(b[16:20], []byte{198, 51, 100, 1})
 	tcp := b[20:]
-	binary.BigEndian.PutUint16(tcp, 40001)
+	binary.BigEndian.PutUint16(tcp, p.port)
 	binary.BigEndian.PutUint16(tcp[2:], 443)
 	binary.BigEndian.PutUint32(tcp[4:], p.seq)
 	binary.BigEndian.PutUint32(tcp[8:], p.ack)
 	tcp[12], tcp[13] = 5<<4, flags
-	binary.BigEndian.PutUint16(tcp[14:], 32768)
+	binary.BigEndian.PutUint16(tcp[14:], p.window)
 	copy(tcp[20:], data)
 	// Input checksum verification is disabled in this library's lwipopts.h.
 	done := make(chan error, 1)
@@ -240,6 +250,96 @@ func TestTCPReceiveCloseDiscardsBufferedData(t *testing.T) {
 			}
 			if n, err := p.conn.Read(make([]byte, 32)); n != 0 || err == nil {
 				t.Fatalf("read after %s = %d, %v; want no bytes and a close error", mode, n, err)
+			}
+		})
+	}
+}
+
+func TestTCPHalfCloseWithUnreadData(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		peerFirst   bool
+		ackLocalFIN bool
+		queueOutput bool
+	}{
+		{name: "peer-fin-first", peerFirst: true},
+		{name: "peer-fin-first-with-queued-output", peerFirst: true, queueOutput: true},
+		{name: "close-write-first", ackLocalFIN: true},
+		{name: "crossed-fins"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			window := uint16(32768)
+			if tc.queueOutput {
+				window = 0
+			}
+			p := newReceiveTestPeerWithWindow(t, nil, window)
+			p.release()
+			inbound := []byte("last upload bytes")
+			outbound := []byte("last response bytes")
+			if n, err := p.conn.Write(outbound); n != len(outbound) || err != nil {
+				t.Fatalf("write response = %d, %v", n, err)
+			}
+			if tc.peerFirst {
+				p.send(25, inbound)
+			}
+			if err := p.conn.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+
+			var received []byte
+			var finAck uint32
+			drain := func() {
+				for {
+					select {
+					case packet := <-p.output:
+						tcp := packet[int(packet[0]&15)*4:]
+						if tcp[13]&4 != 0 {
+							t.Fatal("clean half-close sent a reset")
+						}
+						data := tcp[int(tcp[12]>>4)*4:]
+						received = append(received, data...)
+						if tcp[13]&1 != 0 {
+							finAck = binary.BigEndian.Uint32(tcp[4:]) + uint32(len(data)) + 1
+						}
+					default:
+						return
+					}
+				}
+			}
+			drain()
+			if tc.peerFirst {
+				if finAck != 0 {
+					t.Fatal("sent FIN before returning credit for unread input")
+				}
+			} else {
+				if finAck == 0 {
+					t.Fatal("CloseWrite did not send FIN")
+				}
+				if tc.ackLocalFIN {
+					p.ack = finAck
+				}
+				p.send(25, inbound)
+			}
+			if tc.queueOutput && len(received) != 0 {
+				t.Fatal("response sent despite closed peer window")
+			}
+			p.read(inbound)
+			if n, err := p.conn.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+				t.Fatalf("read after FIN = %d, %v, want EOF", n, err)
+			}
+			if tc.queueOutput {
+				p.window = 32768
+				p.send(16, nil)
+			}
+			drain()
+			if finAck == 0 || !bytes.Equal(received, outbound) {
+				t.Fatalf("peer received %q, FIN=%v", received, finAck != 0)
+			}
+			p.ack = finAck
+			p.send(16, nil)
+			drain()
+			if _, ok := tcpConns.Load(p.conn.(*tcpConn).connKey); ok {
+				t.Fatal("Go connection still owns a PCB after both sides closed")
 			}
 		})
 	}
