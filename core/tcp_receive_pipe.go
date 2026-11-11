@@ -11,6 +11,8 @@ var errTCPReceivePipeFull = errors.New("TCP receive pipe full")
 // tcpReceivePipe separates the lwIP producer from the potentially slow reader.
 // The producer copies data before lwIP frees its packet. It never waits for a
 // reader or for capacity. The caller returns TCP window credit after reading.
+// One limit-sized payload array is allocated on first nonempty accepted input
+// and reused until the pipe is discarded or finished input has drained.
 type tcpReceivePipe struct {
 	mu    sync.Mutex
 	ready sync.Cond
@@ -40,20 +42,8 @@ func (p *tcpReceivePipe) tryWrite(data []byte) error {
 		return nil
 	}
 
-	if need := p.size + len(data); need > len(p.buf) {
-		capacity := len(p.buf)
-		if capacity == 0 {
-			capacity = 512
-		}
-		for capacity < need {
-			capacity *= 2
-		}
-		if capacity > p.limit {
-			capacity = p.limit
-		}
-		buf := make([]byte, capacity)
-		p.copyTo(buf[:p.size])
-		p.buf, p.head = buf, 0
+	if p.buf == nil {
+		p.buf = make([]byte, p.limit)
 	}
 
 	tail := (p.head + p.size) % len(p.buf)

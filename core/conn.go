@@ -14,7 +14,9 @@ type TCPConn interface {
 	// Sent will be called when sent data has been acknowledged by peer.
 	Sent(len uint16) error
 
-	// Receive will be called when data arrives from TUN.
+	// Receive copies borrowed TUN input into a queue bounded by TCP_WND.
+	// It does not wait for a reader or capacity. On a full result, the native
+	// callback retains its pbuf for lwIP to retry instead of freeing it.
 	Receive(data []byte) error
 
 	// Err will be called when a fatal error has occurred on the connection.

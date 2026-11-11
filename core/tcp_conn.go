@@ -34,8 +34,8 @@ const (
 	tcpWriteClosed
 
 	// tcpReceiveClosed indicates lwIP has received a FIN segment from
-	// local peer, the reading side is closed, no more data can be read
-	// from TUN, but handler can still write data to TUN.
+	// local peer. Buffered input remains readable before EOF, and the
+	// handler can still write data to TUN.
 	tcpReceiveClosed
 
 	// tcpClosing indicates both reading side and writing side are closed,

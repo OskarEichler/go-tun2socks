@@ -92,17 +92,26 @@ fall outside its window or arrive while refused data remains.
 
 Each connection owns its pipe state and ring; rings are not shared across
 connections. Payload storage is lazy: no receive data means no ring array.
-The first input allocates a fitting power-of-two array, starting at 512 bytes.
-Higher buffered occupancy can grow that array up to `TCP_WND`, copying unread
-bytes into the replacement. Ordinary reads, writes with enough capacity and
-ring wrap reuse the array. A 1,460 + 34 byte handshake uses one 2 KiB array;
-gradual growth to 32 KiB can allocate at seven capacity steps.
+The first nonempty input that fits allocates one `TCP_WND`-sized array, currently
+32 KiB. Empty or rejected oversized input does not allocate that array. All
+subsequent reads, writes and ring wrap reuse the same storage; there is no
+growth, compaction or replacement array. After closure releases the array,
+further writes return the stored terminal error and cannot allocate it again.
+
+This allocates payload storage once per connection, in exchange for reserving
+more memory for small flows. A 1,460 + 34 byte handshake now reserves
+32 KiB as soon as its first segment arrives; the earlier growth policy initially
+reserved 2 KiB for that case. A connection that never receives data still
+allocates no payload array. Filling the entire window no longer allocates or
+copies intermediate growth arrays. The per-connection pipe/condition state is
+additional to this one payload allocation.
 
 Retained ring payload is bounded by `N * TCP_WND` for `N` connections, in addition
-to connection state, native packet buffers and consumer-owned buffers. Old
-arrays from growth can remain until GC. This is not an aggregate TCP memory
-limit or a claim that the whole packet path is allocation-free. The existing
-chained-pbuf path can borrow/allocate scratch space to flatten native packets.
+to connection state, native packet buffers and consumer-owned buffers. Releasing
+the array reference makes it eligible for GC; it is not a synchronous release to
+the operating system. This is not an aggregate TCP memory limit or a claim that
+the whole packet path is allocation-free. The existing chained-pbuf path can
+borrow/allocate scratch space to flatten native packets.
 
 ## Lock and wait contracts
 
@@ -164,12 +173,15 @@ Run the receive-pipe and packet-driven tests together:
 ```sh
 go test -vet=off -race -count=5 -timeout=60s ./core
 go test -vet=off -race -count=1 -timeout=60s ./...
+go test -vet=off -run '^$' -bench '^BenchmarkTCPReceivePipe$' -benchmem ./core
 ```
 
 `tcp_receive_test.go` drives native callbacks with segmented early data, a full
 32 KiB advertised window, reopening and ordered ring wrap, FIN, reset and reader
 shutdown. `review_close_test.go` checks FIN with unread data and blocked-writer
-wakeups. `tcp_receive_pipe_test.go` checks allocation/capacity and buffered EOF.
+wakeups. `tcp_receive_pipe_test.go` checks lazy allocation, storage reuse,
+zero steady-state write/read allocations, capacity, ring wrap and buffered EOF;
+its small-flow/full-window benchmarks report per-connection allocation costs.
 The library commands disable vet because the existing `string(int)` conversion
 in `core/errors.go` is reported by current Go vet. Consumer integration should
 also be checked with the actual SDK handler and application module replacement.
