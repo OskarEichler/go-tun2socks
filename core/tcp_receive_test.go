@@ -288,6 +288,7 @@ func TestTCPHalfCloseWithUnreadData(t *testing.T) {
 
 			var received []byte
 			var finAck uint32
+			acknowledgedFIN := false
 			drain := func() {
 				for {
 					select {
@@ -308,8 +309,13 @@ func TestTCPHalfCloseWithUnreadData(t *testing.T) {
 			}
 			drain()
 			if tc.peerFirst {
+				if !tc.queueOutput && finAck == 0 {
+					t.Fatal("CloseWrite waited for the reader before sending FIN")
+				}
 				if finAck != 0 {
-					t.Fatal("sent FIN before returning credit for unread input")
+					p.ack = finAck
+					p.send(16, nil)
+					acknowledgedFIN = true
 				}
 			} else {
 				if finAck == 0 {
@@ -335,9 +341,11 @@ func TestTCPHalfCloseWithUnreadData(t *testing.T) {
 			if finAck == 0 || !bytes.Equal(received, outbound) {
 				t.Fatalf("peer received %q, FIN=%v", received, finAck != 0)
 			}
-			p.ack = finAck
-			p.send(16, nil)
-			drain()
+			if !acknowledgedFIN {
+				p.ack = finAck
+				p.send(16, nil)
+				drain()
+			}
 			if _, ok := tcpConns.Load(p.conn.(*tcpConn).connKey); ok {
 				t.Fatal("Go connection still owns a PCB after both sides closed")
 			}

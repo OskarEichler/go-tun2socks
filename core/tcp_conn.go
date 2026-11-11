@@ -92,7 +92,7 @@ func newTCPConn(pcb *C.struct_tcp_pcb, handler TCPConnHandler) (TCPConn, error) 
 		remoteAddr:  ParseTCPAddr(ipAddrNTOA(pcb.local_ip), uint16(pcb.local_port)),
 		connKeyArg:  connKeyArg,
 		connKey:     connKey,
-		canWrite:    sync.NewCond(&sync.Mutex{}),
+		canWrite:    sync.NewCond(lwipMutex),
 		state:       tcpNewConn,
 		receivePipe: newTCPReceivePipe(int(C.TCP_WND)),
 	}
@@ -205,8 +205,6 @@ func (conn *tcpConn) creditReceived(n int) {
 		return
 	}
 	C.tcp_recved(conn.pcb, C.u16_t(n))
-	C.tcp_output(conn.pcb)
-	conn.closeIfDrained()
 }
 
 // writeInternal enqueues data to snd_buf, and treats ERR_MEM returned by tcp_write not an error,
@@ -258,9 +256,7 @@ func (conn *tcpConn) Write(data []byte) (int, error) {
 	defer conn.canWrite.L.Unlock()
 
 	for len(data) > 0 {
-		lwipMutex.Lock()
 		if err := conn.writeCheck(); err != nil {
-			lwipMutex.Unlock()
 			return totalWritten, err
 		}
 
@@ -273,12 +269,10 @@ func (conn *tcpConn) Write(data []byte) (int, error) {
 			written, err := conn.writeInternal(data[0:toWrite])
 			totalWritten += written
 			if err != nil {
-				lwipMutex.Unlock()
 				return totalWritten, err
 			}
 			data = data[written:len(data)]
 		}
-		lwipMutex.Unlock()
 		if len(data) == 0 {
 			break // Don't block if all the data has been written.
 		}
@@ -299,14 +293,12 @@ func (conn *tcpConn) CloseWrite() error {
 	}
 	if conn.state == tcpReceiveClosed {
 		conn.state = tcpClosing
-		// The peer sent FIN first. Keep the PCB in CLOSE_WAIT until reads
-		// have returned credit, then close and detach before LAST_ACK.
-		conn.closeIfDrained()
-		return nil
+		return conn.closeInternal()
 	}
 	conn.state = tcpWriteClosed
 	// FIXME Handle tcp_shutdown error.
 	C.tcp_shutdown(conn.pcb, 0, 1)
+	conn.canWrite.Broadcast()
 	return nil
 }
 
@@ -327,23 +319,11 @@ func (conn *tcpConn) Sent(len uint16) error {
 func (conn *tcpConn) checkClosing() error {
 	conn.Lock()
 	defer conn.Unlock()
-	if conn.closeIfDrained() {
+	if conn.state == tcpClosing {
+		conn.closeInternal()
 		return NewLWIPError(LWIP_ERR_OK)
 	}
 	return nil
-}
-
-// closeIfDrained requires lwipMutex and conn.Mutex. Only CLOSE_WAIT needs
-// to wait: tcp_close there resets the connection if bytes are uncredited.
-// If we sent FIN first, lwIP can take over in CLOSING/TIME_WAIT immediately
-// while Go still lets the reader drain the pipe.
-func (conn *tcpConn) closeIfDrained() bool {
-	if conn.state != tcpClosing ||
-		(conn.pcb.state == C.CLOSE_WAIT && conn.pcb.rcv_wnd != C.TCP_WND) {
-		return false
-	}
-	conn.closeInternal()
-	return true
 }
 
 func (conn *tcpConn) checkAborting() error {
@@ -431,8 +411,14 @@ func (conn *tcpConn) closeInternal() error {
 
 	conn.release()
 
-	// FIXME Handle error.
-	err := C.tcp_close(conn.pcb)
+	var err C.err_t
+	if conn.pcb.state == C.CLOSE_WAIT {
+		// Peer FIN already ended input. Send our FIN without treating unread
+		// Go-buffered bytes as a receive abort. lwIP owns the PCB from here.
+		err = C.tcp_shutdown(conn.pcb, 0, 1)
+	} else {
+		err = C.tcp_close(conn.pcb)
+	}
 	if err == C.ERR_OK {
 		return nil
 	} else {
@@ -468,7 +454,6 @@ func (conn *tcpConn) Err(err error) {
 	conn.receivePipe.discard()
 	conn.release()
 	conn.state = tcpErrored
-	conn.canWrite.Broadcast()
 }
 
 func (conn *tcpConn) LocalClosed() error {
@@ -483,6 +468,7 @@ func (conn *tcpConn) release() {
 	}
 	conn.receivePipe.finish()
 	conn.state = tcpClosed
+	conn.canWrite.Broadcast()
 }
 
 func (conn *tcpConn) Poll() error {
