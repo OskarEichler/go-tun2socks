@@ -6,7 +6,6 @@ package core
 */
 import "C"
 import (
-	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -246,7 +245,6 @@ func (conn *tcpConn) writeCheck() error {
 	default:
 		panic("unexpected error")
 	}
-	return nil
 }
 
 func (conn *tcpConn) Write(data []byte) (int, error) {
@@ -425,7 +423,7 @@ func (conn *tcpConn) closeInternal() error {
 	if err == C.ERR_OK {
 		return nil
 	} else {
-		return errors.New(fmt.Sprintf("close TCP connection failed, lwip error code %d", int(err)))
+		return fmt.Errorf("close TCP connection failed, lwip error code %d", int(err))
 	}
 }
 

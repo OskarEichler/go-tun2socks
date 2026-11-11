@@ -92,12 +92,7 @@ func peekNextProto(ipv ipver, p []byte) (proto, error) {
 	}
 }
 
-func input(pkt []byte) (int, error) {
-	lwipMutex.Lock()
-	defer lwipMutex.Unlock()
-	return inputLocked(pkt)
-}
-
+// Caller holds lwipMutex through native dispatch and its callbacks.
 func inputLocked(pkt []byte) (int, error) {
 	if len(pkt) == 0 {
 		return 0, nil

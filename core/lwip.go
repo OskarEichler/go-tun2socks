@@ -81,9 +81,11 @@ func NewLWIPStack() LWIPStack {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
+		ticker := time.NewTicker(CHECK_TIMEOUTS_INTERVAL * time.Millisecond)
+		defer ticker.Stop()
 		for {
 			select {
-			case <-time.After(CHECK_TIMEOUTS_INTERVAL * time.Millisecond):
+			case <-ticker.C:
 				lwipMutex.Lock()
 				select {
 				case <-ctx.Done():

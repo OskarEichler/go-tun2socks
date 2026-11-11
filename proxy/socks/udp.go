@@ -1,7 +1,6 @@
 package socks
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,28 +14,23 @@ import (
 	"github.com/eycorsican/go-tun2socks/core"
 )
 
-// max IP packet size - min IP header size - min UDP header size - min SOCKS5 header size
-const maxUdpPayloadSize = 65535 - 20 - 8 - 7
-
 type udpHandler struct {
 	sync.Mutex
 
-	proxyHost   string
-	proxyPort   uint16
-	udpConns    map[core.UDPConn]*net.UDPConn
-	tcpConns    map[core.UDPConn]net.Conn
-	remoteAddrs map[core.UDPConn]*net.UDPAddr // UDP relay server addresses
-	timeout     time.Duration
+	proxyHost string
+	proxyPort uint16
+	udpConns  map[core.UDPConn]*net.UDPConn
+	tcpConns  map[core.UDPConn]net.Conn
+	timeout   time.Duration
 }
 
 func NewUDPHandler(proxyHost string, proxyPort uint16, timeout time.Duration) core.UDPConnHandler {
 	return &udpHandler{
-		proxyHost:   proxyHost,
-		proxyPort:   proxyPort,
-		udpConns:    make(map[core.UDPConn]*net.UDPConn, 8),
-		tcpConns:    make(map[core.UDPConn]net.Conn, 8),
-		remoteAddrs: make(map[core.UDPConn]*net.UDPAddr, 8),
-		timeout:     timeout,
+		proxyHost: proxyHost,
+		proxyPort: proxyPort,
+		udpConns:  make(map[core.UDPConn]*net.UDPConn, 8),
+		tcpConns:  make(map[core.UDPConn]net.Conn, 8),
+		timeout:   timeout,
 	}
 }
 
@@ -118,7 +112,7 @@ func (h *udpHandler) connectInternal(conn core.UDPConn, dest string) error {
 	if err := c.SetDeadline(deadline); err != nil {
 		return err
 	}
-	if _, err := io.Copy(c, bytes.NewReader([]byte{5, 1, 0})); err != nil {
+	if _, err := c.Write([]byte{5, 1, 0}); err != nil {
 		return err
 	}
 	buf := make([]byte, MaxAddrLen)
@@ -128,7 +122,7 @@ func (h *udpHandler) connectInternal(conn core.UDPConn, dest string) error {
 	if buf[0] != 5 || buf[1] != 0 {
 		return errors.New("SOCKS proxy did not accept no-authentication method")
 	}
-	if _, err := io.Copy(c, bytes.NewReader([]byte{5, socks5UDPAssociate, 0, 1, 0, 0, 0, 0, 0, 0})); err != nil {
+	if _, err := c.Write([]byte{5, socks5UDPAssociate, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
 		return err
 	}
 	if _, err := io.ReadFull(c, buf[:3]); err != nil {
@@ -172,7 +166,7 @@ func (h *udpHandler) connectInternal(conn core.UDPConn, dest string) error {
 		return err
 	}
 	h.Lock()
-	h.tcpConns[conn], h.udpConns[conn], h.remoteAddrs[conn] = c, pc, relay
+	h.tcpConns[conn], h.udpConns[conn] = c, pc
 	h.Unlock()
 	published = true
 	go h.handleTCP(conn, c)
@@ -232,26 +226,26 @@ func parseUDPResponse(packet []byte) (Addr, []byte, error) {
 
 func (h *udpHandler) ReceiveTo(conn core.UDPConn, data []byte, addr *net.UDPAddr) error {
 	h.Lock()
-	pc, ok1 := h.udpConns[conn]
-	_, ok2 := h.remoteAddrs[conn]
+	pc, ok := h.udpConns[conn]
 	h.Unlock()
 
-	if ok1 && ok2 {
+	if ok {
 		address := ParseAddr(addr.String())
 		if address == nil {
 			return errors.New("invalid SOCKS UDP destination")
 		}
-		buf := append([]byte{0, 0, 0}, address...)
-		buf = append(buf, data[:]...)
+		buf := make([]byte, 3+len(address)+len(data))
+		copy(buf[3:], address)
+		copy(buf[3+len(address):], data)
 		_, err := pc.Write(buf)
 		if err != nil {
 			h.Close(conn)
-			return errors.New(fmt.Sprintf("write remote failed: %v", err))
+			return fmt.Errorf("write remote failed: %v", err)
 		}
 		return nil
 	} else {
 		h.Close(conn)
-		return errors.New(fmt.Sprintf("proxy connection %v->%v does not exists", conn.LocalAddr(), addr))
+		return fmt.Errorf("proxy connection %v->%v does not exist", conn.LocalAddr(), addr)
 	}
 }
 
@@ -269,5 +263,4 @@ func (h *udpHandler) Close(conn core.UDPConn) {
 		pc.Close()
 		delete(h.udpConns, conn)
 	}
-	delete(h.remoteAddrs, conn)
 }

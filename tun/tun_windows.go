@@ -12,8 +12,6 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"syscall"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -36,8 +34,6 @@ func tap_control_code(request, method uint32) uint32 {
 }
 
 var (
-	k32                               = windows.NewLazySystemDLL("kernel32.dll")
-	procGetOverlappedResult           = k32.NewProc("GetOverlappedResult")
 	TAP_IOCTL_GET_MTU                 = tap_control_code(3, 0)
 	TAP_IOCTL_SET_MEDIA_STATUS        = tap_control_code(6, 0)
 	TAP_IOCTL_CONFIG_TUN              = tap_control_code(10, 0)
@@ -258,7 +254,7 @@ func OpenTunDevice(name, addr, gw, mask string, dns []string, persist bool) (io.
 }
 
 type winTapDev struct {
-	// TODO Not sure if a read lock is needed.
+	// Reads share one buffer and OVERLAPPED operation.
 	readLock sync.Mutex
 	// Write is not allowed concurrent accessing.
 	writeLock sync.Mutex
@@ -308,7 +304,6 @@ func (dev *winTapDev) Read(data []byte) (int, error) {
 
 	for {
 		var done uint32
-		var nr int
 
 		dev.stateLock.Lock()
 		if dev.closed {
@@ -321,29 +316,27 @@ func (dev *winTapDev) Read(data []byte) (int, error) {
 			if err != windows.ERROR_IO_PENDING {
 				return 0, err
 			} else {
-				windows.WaitForSingleObject(dev.rOverlapped.HEvent, windows.INFINITE)
-				nr, err = getOverlappedResult(dev.fd, &dev.rOverlapped)
+				err = windows.GetOverlappedResult(dev.fd, &dev.rOverlapped, &done, true)
 				if err != nil {
 					return 0, err
 				}
 			}
-		} else {
-			nr = int(done)
 		}
+		nr := int(done)
 		if nr > 14 {
 			// discard IPv6 packets
 			if dev.rBuf[14]&0xf0 == 0x60 {
 				continue
 			} else if dev.rBuf[14]&0xf0 == 0x40 {
-				dev.writeLock.Lock()
 				if !dev.wInitiated {
+					dev.writeLock.Lock()
 					// copy ether header for writing
 					copy(dev.wBuf[:], dev.rBuf[6:12])
 					copy(dev.wBuf[6:], dev.rBuf[0:6])
 					copy(dev.wBuf[12:], dev.rBuf[12:14])
 					dev.wInitiated = true
+					dev.writeLock.Unlock()
 				}
-				dev.writeLock.Unlock()
 				return copy(data, dev.rBuf[14:nr]), nil
 			}
 		}
@@ -355,7 +348,6 @@ func (dev *winTapDev) Write(data []byte) (int, error) {
 	defer dev.writeLock.Unlock()
 
 	var done uint32
-	var nw int
 
 	if len(data) > len(dev.wBuf)-14 {
 		return 0, io.ErrShortBuffer
@@ -373,32 +365,18 @@ func (dev *winTapDev) Write(data []byte) (int, error) {
 		if err != windows.ERROR_IO_PENDING {
 			return 0, err
 		} else {
-			windows.WaitForSingleObject(dev.wOverlapped.HEvent, windows.INFINITE)
-			nw, err = getOverlappedResult(dev.fd, &dev.wOverlapped)
+			err = windows.GetOverlappedResult(dev.fd, &dev.wOverlapped, &done, true)
 			if err != nil {
 				return 0, err
 			}
 		}
-	} else {
-		nw = int(done)
 	}
+	nw := int(done)
 	if nw != packetL {
 		return 0, fmt.Errorf("write %d packet (%d bytes payload), return %d", packetL, payloadL, nw)
 	} else {
 		return payloadL, nil
 	}
-}
-
-func getOverlappedResult(h windows.Handle, overlapped *windows.Overlapped) (int, error) {
-	var n int
-	r, _, err := syscall.Syscall6(procGetOverlappedResult.Addr(), 4,
-		uintptr(h),
-		uintptr(unsafe.Pointer(overlapped)),
-		uintptr(unsafe.Pointer(&n)), 1, 0, 0)
-	if r == 0 {
-		return n, err
-	}
-	return n, nil
 }
 
 func (dev *winTapDev) Close() error {
