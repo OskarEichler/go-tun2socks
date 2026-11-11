@@ -4,6 +4,9 @@
 
 A tun2socks implementation written in Go.
 
+For the native callback flow, lock ownership, TCP buffering and connection
+lifecycle, see [TCP data flow and backpressure](docs/tcp-data-flow.md).
+
 > If you're looking for an easy to use `tun2socks` implementation for iOS, you might be interested in [`leaf`](https://github.com/eycorsican/leaf) and [`ileaf`](https://github.com/eycorsican/ileaf).
 > `leaf` [implements `tun2socks`](https://github.com/eycorsican/leaf/tree/master/leaf/src/proxy/tun/netstack) and it's written in Rust, with significantly less memory usage and significantly better performance compares to the Go version.
 
