@@ -13,6 +13,21 @@ import (
 	"unsafe"
 )
 
+// These limits bound connecting handlers, queued packets and queued payloads
+// across the process. UDP overload drops packets so the peer can recover.
+const (
+	maxUDPConnections  = 1024
+	maxUDPPendingBytes = 8 << 20
+	maxUDPQueuePackets = 64
+	maxUDPQueueBytes   = 256 << 10
+)
+
+var udpAdmission struct {
+	sync.Mutex
+	connections int
+	bytes       int
+}
+
 type udpConnState uint
 
 const (
@@ -28,131 +43,177 @@ type udpPacket struct {
 
 type udpConn struct {
 	sync.Mutex
-
-	pcb       *C.struct_udp_pcb
-	handler   UDPConnHandler
-	localAddr *net.UDPAddr
-	localIP   C.ip_addr_t
-	localPort C.u16_t
-	state     udpConnState
-	pending   chan *udpPacket
+	pcb          *C.struct_udp_pcb
+	handler      UDPConnHandler
+	localAddr    *net.UDPAddr
+	localIP      C.ip_addr_t
+	localPort    C.u16_t
+	state        udpConnState
+	pending      chan *udpPacket
+	pendingBytes int
+	done         chan struct{}
 }
 
+// Caller holds lwipMutex. Publish before starting Connect so a fast failure
+// cannot leave a closed connection in the map.
 func newUDPConn(pcb *C.struct_udp_pcb, handler UDPConnHandler, localIP C.ip_addr_t, localPort C.u16_t, localAddr, remoteAddr *net.UDPAddr) (UDPConn, error) {
-	conn := &udpConn{
-		handler:   handler,
-		pcb:       pcb,
-		localAddr: localAddr,
-		localIP:   localIP,
-		localPort: localPort,
-		state:     udpConnecting,
-		pending:   make(chan *udpPacket, 64), // To hold the early packets on the connection
+	udpAdmission.Lock()
+	if udpAdmission.connections >= maxUDPConnections {
+		udpAdmission.Unlock()
+		return nil, errors.New("UDP connection limit reached")
 	}
+	udpAdmission.connections++
+	udpAdmission.Unlock()
 
-	go func() {
-		err := handler.Connect(conn, remoteAddr)
-		if err != nil {
-			conn.Close()
-		} else {
-			conn.Lock()
-			conn.state = udpConnected
-			conn.Unlock()
-			// Once connected, send all pending data.
-		DrainPending:
-			for {
-				select {
-				case pkt := <-conn.pending:
-					err := conn.handler.ReceiveTo(conn, pkt.data, pkt.addr)
-					if err != nil {
-						break DrainPending
-					}
-					continue DrainPending
-				default:
-					conn.pending = nil
-					break DrainPending
-				}
-			}
-		}
-	}()
-
+	conn := &udpConn{
+		pcb: pcb, handler: handler, localAddr: localAddr,
+		localIP: localIP, localPort: localPort, state: udpConnecting,
+		pending: make(chan *udpPacket, maxUDPQueuePackets),
+		done:    make(chan struct{}),
+	}
+	udpConns.Store(udpConnId{src: localAddr.String()}, conn)
+	go conn.run(remoteAddr)
 	return conn, nil
 }
 
-func (conn *udpConn) LocalAddr() *net.UDPAddr {
-	return conn.localAddr
-}
-
-func (conn *udpConn) checkState() error {
-	conn.Lock()
-	defer conn.Unlock()
-
-	switch conn.state {
-	case udpClosed:
-		return errors.New("connection closed")
-	case udpConnected:
-		return nil
-	case udpConnecting:
-		return errors.New("not connected")
+func (conn *udpConn) run(remoteAddr *net.UDPAddr) {
+	defer func() {
+		conn.Close()
+		udpAdmission.Lock()
+		udpAdmission.connections--
+		udpAdmission.Unlock()
+	}()
+	if err := conn.handler.Connect(conn, remoteAddr); err != nil {
+		return
 	}
-	return nil
-}
-
-// If the connection isn't ready yet, and there is room in the queue, make a copy
-// and hold onto it until the connection is ready.
-func (conn *udpConn) enqueueEarlyPacket(data []byte, addr *net.UDPAddr) bool {
 	conn.Lock()
-	defer conn.Unlock()
-	if conn.state == udpConnecting {
-		pkt := &udpPacket{data: append([]byte(nil), data...), addr: addr}
+	if conn.state == udpClosed {
+		conn.Unlock()
+		return
+	}
+	conn.state = udpConnected
+	conn.Unlock()
+
+	for {
 		select {
-		// Data will be dropped if pending is full.
-		case conn.pending <- pkt:
-			return true
-		default:
+		case <-conn.done:
+			return
+		case pkt := <-conn.pending:
+			conn.Lock()
+			closed := conn.state == udpClosed
+			conn.Unlock()
+			if !closed {
+				// A send error applies to this packet. Handlers own association
+				// expiry and may call Close when their session has ended.
+				conn.handler.ReceiveTo(conn, pkt.data, pkt.addr)
+			}
+			conn.releasePacket(pkt)
+			if closed {
+				return
+			}
 		}
 	}
-	return false
 }
 
+func (conn *udpConn) LocalAddr() *net.UDPAddr { return conn.localAddr }
+
+// ReceiveTo copies borrowed lwIP data only after both local and aggregate
+// admission succeed. The worker invokes all handlers outside lwipMutex.
 func (conn *udpConn) ReceiveTo(data []byte, addr *net.UDPAddr) error {
-	if conn.enqueueEarlyPacket(data, addr) {
+	conn.Lock()
+	defer conn.Unlock()
+	if conn.state == udpClosed {
+		return errors.New("connection closed")
+	}
+	if len(conn.pending) == cap(conn.pending) || len(data) > maxUDPQueueBytes-conn.pendingBytes {
 		return nil
 	}
-	if err := conn.checkState(); err != nil {
-		return err
+	udpAdmission.Lock()
+	if len(data) > maxUDPPendingBytes-udpAdmission.bytes {
+		udpAdmission.Unlock()
+		return nil
 	}
-	err := conn.handler.ReceiveTo(conn, data, addr)
-	if err != nil {
-		return errors.New(fmt.Sprintf("write proxy failed: %v", err))
-	}
+	udpAdmission.bytes += len(data)
+	udpAdmission.Unlock()
+	conn.pendingBytes += len(data)
+	peer := *addr
+	peer.IP = append(net.IP(nil), addr.IP...)
+	conn.pending <- &udpPacket{data: append([]byte(nil), data...), addr: &peer}
 	return nil
+}
+
+func (conn *udpConn) releasePacket(pkt *udpPacket) {
+	conn.Lock()
+	defer conn.Unlock()
+	conn.releasePacketLocked(pkt)
+}
+
+func (conn *udpConn) releasePacketLocked(pkt *udpPacket) {
+	conn.pendingBytes -= len(pkt.data)
+	udpAdmission.Lock()
+	udpAdmission.bytes -= len(pkt.data)
+	udpAdmission.Unlock()
 }
 
 func (conn *udpConn) WriteFrom(data []byte, addr *net.UDPAddr) (int, error) {
 	if len(data) == 0 {
 		return 0, nil
 	}
-	if err := conn.checkState(); err != nil {
-		return 0, err
+	// The native pbuf length includes the IP and UDP headers.
+	headerLen := 40
+	if conn.localAddr.IP.To4() != nil {
+		headerLen = 20
 	}
-	// FIXME any memory leaks?
-	cremoteIP := C.struct_ip_addr{}
-	if err := ipAddrATON(addr.IP.String(), &cremoteIP); err != nil {
+	if addr == nil || addr.Port < 0 || addr.Port > 65535 || len(data) > 65535-headerLen-8 {
+		return 0, errors.New("invalid UDP response address or length")
+	}
+	lwipMutex.Lock()
+	defer lwipMutex.Unlock()
+	conn.Lock()
+	defer conn.Unlock()
+	if conn.state == udpClosed {
+		return 0, errors.New("connection closed")
+	}
+	remoteIP := C.struct_ip_addr{}
+	if err := ipAddrATON(addr.IP.String(), &remoteIP); err != nil {
 		return 0, err
 	}
 	buf := C.pbuf_alloc_reference(unsafe.Pointer(&data[0]), C.u16_t(len(data)), C.PBUF_ROM)
+	if buf == nil {
+		return 0, errors.New("cannot allocate native UDP buffer")
+	}
 	defer C.pbuf_free(buf)
-	C.udp_sendto(conn.pcb, buf, &conn.localIP, conn.localPort, &cremoteIP, C.u16_t(addr.Port))
+	if err := C.udp_sendto(conn.pcb, buf, &conn.localIP, conn.localPort, &remoteIP, C.u16_t(addr.Port)); err != C.ERR_OK {
+		return 0, fmt.Errorf("native UDP send failed: %d", int(err))
+	}
 	return len(data), nil
 }
 
 func (conn *udpConn) Close() error {
-	connId := udpConnId{
-		src: conn.LocalAddr().String(),
-	}
-	conn.Lock()
-	conn.state = udpClosed
-	conn.Unlock()
-	udpConns.Delete(connId)
+	lwipMutex.Lock()
+	defer lwipMutex.Unlock()
+	conn.closeLocked()
 	return nil
+}
+
+func (conn *udpConn) closeLocked() {
+	conn.Lock()
+	defer conn.Unlock()
+	if conn.state == udpClosed {
+		return
+	}
+	conn.state = udpClosed
+	close(conn.done)
+	id := udpConnId{src: conn.localAddr.String()}
+	if current, ok := udpConns.Load(id); ok && current == conn {
+		udpConns.Delete(id)
+	}
+	for {
+		select {
+		case pkt := <-conn.pending:
+			conn.releasePacketLocked(pkt)
+		default:
+			return
+		}
+	}
 }

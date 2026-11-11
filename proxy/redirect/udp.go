@@ -39,13 +39,13 @@ func (h *udpHandler) fetchUDPInput(conn core.UDPConn, pc *net.UDPConn) {
 
 	for {
 		pc.SetDeadline(time.Now().Add(h.timeout))
-		n, addr, err := pc.ReadFromUDP(buf)
+		n, err := pc.Read(buf)
 		if err != nil {
 			// log.Printf("failed to read UDP data from remote: %v", err)
 			return
 		}
 
-		_, err = conn.WriteFrom(buf[:n], addr)
+		_, err = conn.WriteFrom(buf[:n], pc.RemoteAddr().(*net.UDPAddr))
 		if err != nil {
 			log.Warnf("failed to write UDP data to TUN")
 			return
@@ -54,30 +54,31 @@ func (h *udpHandler) fetchUDPInput(conn core.UDPConn, pc *net.UDPConn) {
 }
 
 func (h *udpHandler) Connect(conn core.UDPConn, target *net.UDPAddr) error {
-	bindAddr := &net.UDPAddr{IP: nil, Port: 0}
-	pc, err := net.ListenUDP("udp", bindAddr)
+	tgtAddr, err := net.ResolveUDPAddr("udp", h.target)
 	if err != nil {
-		log.Errorf("failed to bind udp address")
 		return err
 	}
-	tgtAddr, _ := net.ResolveUDPAddr("udp", h.target)
+	pc, err := net.DialUDP("udp", nil, tgtAddr)
+	if err != nil {
+		return err
+	}
 	h.Lock()
 	h.udpTargetAddrs[conn] = tgtAddr
 	h.udpConns[conn] = pc
 	h.Unlock()
 	go h.fetchUDPInput(conn, pc)
-	log.Infof("new proxy connection for target: %s:%s", target.Network(), target.String())
+	log.Infof("new proxy connection to %v", tgtAddr)
 	return nil
 }
 
 func (h *udpHandler) ReceiveTo(conn core.UDPConn, data []byte, addr *net.UDPAddr) error {
 	h.Lock()
 	pc, ok1 := h.udpConns[conn]
-	tgtAddr, ok2 := h.udpTargetAddrs[conn]
+	_, ok2 := h.udpTargetAddrs[conn]
 	h.Unlock()
 
 	if ok1 && ok2 {
-		_, err := pc.WriteToUDP(data, tgtAddr)
+		_, err := pc.Write(data)
 		if err != nil {
 			log.Warnf("failed to write UDP payload to SOCKS5 server: %v", err)
 			return errors.New("failed to write UDP data")

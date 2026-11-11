@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -253,7 +254,7 @@ func OpenTunDevice(name, addr, gw, mask string, dns []string, persist bool) (io.
 		windows.Close(fd)
 		return nil, err
 	}
-	return newWinTapDev(fd, addr, gw), nil
+	return newWinTapDev(fd)
 }
 
 type winTapDev struct {
@@ -263,10 +264,10 @@ type winTapDev struct {
 	writeLock sync.Mutex
 
 	fd          windows.Handle
-	addr        string
-	addrIP      net.IP
-	gw          string
-	gwIP        net.IP
+	stateLock   sync.Mutex
+	closed      bool
+	closeOnce   sync.Once
+	closeErr    error
 	rBuf        [2048]byte
 	wBuf        [2048]byte
 	wInitiated  bool
@@ -274,13 +275,22 @@ type winTapDev struct {
 	wOverlapped windows.Overlapped
 }
 
-func newWinTapDev(fd windows.Handle, addr string, gw string) *winTapDev {
+func newWinTapDev(fd windows.Handle) (*winTapDev, error) {
 	rOverlapped := windows.Overlapped{}
-	rEvent, _ := windows.CreateEvent(nil, 0, 0, nil)
+	rEvent, err := windows.CreateEvent(nil, 0, 0, nil)
+	if err != nil {
+		windows.Close(fd)
+		return nil, err
+	}
 	rOverlapped.HEvent = windows.Handle(rEvent)
 
 	wOverlapped := windows.Overlapped{}
-	wEvent, _ := windows.CreateEvent(nil, 0, 0, nil)
+	wEvent, err := windows.CreateEvent(nil, 0, 0, nil)
+	if err != nil {
+		windows.Close(rEvent)
+		windows.Close(fd)
+		return nil, err
+	}
 	wOverlapped.HEvent = windows.Handle(wEvent)
 
 	dev := &winTapDev{
@@ -288,13 +298,8 @@ func newWinTapDev(fd windows.Handle, addr string, gw string) *winTapDev {
 		rOverlapped: rOverlapped,
 		wOverlapped: wOverlapped,
 		wInitiated:  false,
-
-		addr:   addr,
-		addrIP: net.ParseIP(addr).To4(),
-		gw:     gw,
-		gwIP:   net.ParseIP(gw).To4(),
 	}
-	return dev
+	return dev, nil
 }
 
 func (dev *winTapDev) Read(data []byte) (int, error) {
@@ -305,7 +310,13 @@ func (dev *winTapDev) Read(data []byte) (int, error) {
 		var done uint32
 		var nr int
 
+		dev.stateLock.Lock()
+		if dev.closed {
+			dev.stateLock.Unlock()
+			return 0, os.ErrClosed
+		}
 		err := windows.ReadFile(dev.fd, dev.rBuf[:], &done, &dev.rOverlapped)
+		dev.stateLock.Unlock()
 		if err != nil {
 			if err != windows.ERROR_IO_PENDING {
 				return 0, err
@@ -320,14 +331,11 @@ func (dev *winTapDev) Read(data []byte) (int, error) {
 			nr = int(done)
 		}
 		if nr > 14 {
-			if isStopMarker(dev.rBuf[14:nr], dev.addrIP, dev.gwIP) {
-				return 0, errors.New("received stop marker")
-			}
-
 			// discard IPv6 packets
 			if dev.rBuf[14]&0xf0 == 0x60 {
 				continue
 			} else if dev.rBuf[14]&0xf0 == 0x40 {
+				dev.writeLock.Lock()
 				if !dev.wInitiated {
 					// copy ether header for writing
 					copy(dev.wBuf[:], dev.rBuf[6:12])
@@ -335,8 +343,8 @@ func (dev *winTapDev) Read(data []byte) (int, error) {
 					copy(dev.wBuf[12:], dev.rBuf[12:14])
 					dev.wInitiated = true
 				}
-				copy(data, dev.rBuf[14:nr])
-				return nr - 14, nil
+				dev.writeLock.Unlock()
+				return copy(data, dev.rBuf[14:nr]), nil
 			}
 		}
 	}
@@ -349,9 +357,18 @@ func (dev *winTapDev) Write(data []byte) (int, error) {
 	var done uint32
 	var nw int
 
+	if len(data) > len(dev.wBuf)-14 {
+		return 0, io.ErrShortBuffer
+	}
 	payloadL := copy(dev.wBuf[14:], data)
 	packetL := payloadL + 14
+	dev.stateLock.Lock()
+	if dev.closed {
+		dev.stateLock.Unlock()
+		return 0, os.ErrClosed
+	}
 	err := windows.WriteFile(dev.fd, dev.wBuf[:packetL], &done, &dev.wOverlapped)
+	dev.stateLock.Unlock()
 	if err != nil {
 		if err != windows.ERROR_IO_PENDING {
 			return 0, err
@@ -385,7 +402,29 @@ func getOverlappedResult(h windows.Handle, overlapped *windows.Overlapped) (int,
 }
 
 func (dev *winTapDev) Close() error {
-	log.Printf("close winTap device")
-	sendStopMarker(dev.addr, dev.gw)
-	return windows.Close(dev.fd)
+	dev.closeOnce.Do(func() {
+		dev.stateLock.Lock()
+		dev.closed = true
+		err := windows.CancelIoEx(dev.fd, nil)
+		dev.stateLock.Unlock()
+
+		// Cancellation completes asynchronously. Join reads and writes before
+		// releasing their OVERLAPPED events or the device handle.
+		closedHandle := false
+		if err != nil && err != windows.ERROR_NOT_FOUND {
+			dev.closeErr = err
+			windows.Close(dev.fd)
+			closedHandle = true
+		}
+		dev.readLock.Lock()
+		defer dev.readLock.Unlock()
+		dev.writeLock.Lock()
+		defer dev.writeLock.Unlock()
+		if !closedHandle {
+			dev.closeErr = windows.Close(dev.fd)
+		}
+		windows.Close(dev.rOverlapped.HEvent)
+		windows.Close(dev.wOverlapped.HEvent)
+	})
+	return dev.closeErr
 }

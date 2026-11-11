@@ -403,6 +403,9 @@ func (conn *tcpConn) setLocalClosed() error {
 
 // Never call this function outside of the lwIP thread.
 func (conn *tcpConn) closeInternal() error {
+	if conn.state >= tcpClosed {
+		return nil
+	}
 	C.tcp_arg(conn.pcb, nil)
 	C.tcp_recv(conn.pcb, nil)
 	C.tcp_sent(conn.pcb, nil)
@@ -429,22 +432,31 @@ func (conn *tcpConn) closeInternal() error {
 // Never call this function outside of the lwIP thread since it calls
 // tcp_abort() and in that case we must return ERR_ABRT to lwIP.
 func (conn *tcpConn) abortInternal() {
+	if conn.state >= tcpClosed {
+		return
+	}
+	// tcp_abort synchronously invokes the error callback. Detach its argument
+	// before release frees the connection key.
+	C.tcp_err(conn.pcb, nil)
+	C.tcp_arg(conn.pcb, nil)
 	conn.receivePipe.discard()
 	conn.release()
 	C.tcp_abort(conn.pcb)
 }
 
 func (conn *tcpConn) Abort() {
-	conn.Lock()
-	// If it's in tcpErrored state, the pcb was already freed.
-	if conn.state < tcpAborting {
-		conn.state = tcpAborting
-	}
-	conn.Unlock()
-
 	lwipMutex.Lock()
-	conn.checkState()
-	lwipMutex.Unlock()
+	defer lwipMutex.Unlock()
+	conn.abortLocked()
+}
+
+func (conn *tcpConn) abortLocked() {
+	conn.Lock()
+	defer conn.Unlock()
+	if conn.state < tcpClosed {
+		conn.state = tcpAborting
+		conn.abortInternal()
+	}
 }
 
 func (conn *tcpConn) Err(err error) {

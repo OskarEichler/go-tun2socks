@@ -34,6 +34,8 @@ func (h *udpHandler) Connect(conn core.UDPConn, udpAddr *net.UDPAddr) error {
 }
 
 func (h *udpHandler) ReceiveTo(conn core.UDPConn, data []byte, addr *net.UDPAddr) error {
+	// A truncated DNS response completes this stateless UDP association.
+	defer conn.Close()
 	if len(data) < dnsHeaderLength {
 		return errors.New("Received malformed DNS query")
 	}

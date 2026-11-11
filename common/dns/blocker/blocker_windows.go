@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 package blocker
@@ -106,16 +107,9 @@ func BlockOutsideDns(tunName string) error {
 	}
 	log.Debugf("Added filter to allow all IPv4 traffic to %v", tunName)
 
-	// Block all UDP traffic targeting port 53.
-	blockAllUDP53Condition := []FWPM_FILTER_CONDITION0{
+	// Block IPv4 DNS on port 53 for both TCP and UDP.
+	blockAllDNS53Condition := []FWPM_FILTER_CONDITION0{
 		{
-			FieldKey:  FWPM_CONDITION_IP_PROTOCOL,
-			MatchType: FWP_MATCH_EQUAL,
-			ConditionValue: FWP_CONDITION_VALUE0{
-				Type:  FWP_UINT8,
-				Value: uintptr(uint8(IPPROTO_UDP)),
-			},
-		}, {
 			FieldKey:  FWPM_CONDITION_IP_REMOTE_PORT,
 			MatchType: FWP_MATCH_EQUAL,
 			ConditionValue: FWP_CONDITION_VALUE0{
@@ -124,14 +118,14 @@ func BlockOutsideDns(tunName string) error {
 			},
 		},
 	}
-	blockAllUDP53FilterDisplayData, err := CreateDisplayData("DnsBlocker", "Block all UDP traffic targeting port 53")
+	blockAllDNS53FilterDisplayData, err := CreateDisplayData("DnsBlocker", "Block IPv4 TCP and UDP traffic targeting port 53")
 	if err != nil {
 		return fmt.Errorf("failed to create filter display data: %v", err)
 	}
-	blockAllUDP53Filter := FWPM_FILTER0{
-		FilterCondition:     (*FWPM_FILTER_CONDITION0)(unsafe.Pointer(&blockAllUDP53Condition[0])),
-		NumFilterConditions: 2,
-		DisplayData:         *blockAllUDP53FilterDisplayData,
+	blockAllDNS53Filter := FWPM_FILTER0{
+		FilterCondition:     (*FWPM_FILTER_CONDITION0)(unsafe.Pointer(&blockAllDNS53Condition[0])),
+		NumFilterConditions: 1,
+		DisplayData:         *blockAllDNS53FilterDisplayData,
 		SubLayerKey:         key,
 		LayerKey:            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
 		Action: FWPM_ACTION0{
@@ -142,11 +136,11 @@ func BlockOutsideDns(tunName string) error {
 			Value: uintptr(10),
 		},
 	}
-	err = FwpmFilterAdd0(engine, &blockAllUDP53Filter, 0, &filterId)
+	err = FwpmFilterAdd0(engine, &blockAllDNS53Filter, 0, &filterId)
 	if err != nil {
 		return fmt.Errorf("failed to add filter: %v", err)
 	}
-	log.Debugf("Added filter to block all IPv4 UDP traffic targeting port 53")
+	log.Debugf("Added filter to block IPv4 TCP and UDP traffic targeting port 53")
 
 	return nil
 }

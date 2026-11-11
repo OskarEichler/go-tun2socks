@@ -31,13 +31,16 @@ type lwipStack struct {
 	tpcb *C.struct_tcp_pcb
 	upcb *C.struct_udp_pcb
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once
 }
 
 // NewLWIPStack listens for any incoming connections/packets and registers
 // corresponding accept/recv callback functions.
 func NewLWIPStack() LWIPStack {
+	lwipMutex.Lock()
+	defer lwipMutex.Unlock()
 	tcpPCB := C.tcp_new()
 	if tcpPCB == nil {
 		panic("tcp_new return nil")
@@ -82,6 +85,12 @@ func NewLWIPStack() LWIPStack {
 			select {
 			case <-time.After(CHECK_TIMEOUTS_INTERVAL * time.Millisecond):
 				lwipMutex.Lock()
+				select {
+				case <-ctx.Done():
+					lwipMutex.Unlock()
+					return
+				default:
+				}
 				C.sys_check_timeouts()
 				lwipMutex.Unlock()
 			case <-ctx.Done():
@@ -100,11 +109,13 @@ func NewLWIPStack() LWIPStack {
 
 // Write writes IP packets to the stack.
 func (s *lwipStack) Write(data []byte) (int, error) {
+	lwipMutex.Lock()
+	defer lwipMutex.Unlock()
 	select {
 	case <-s.ctx.Done():
 		return 0, errors.New("stack closed")
 	default:
-		return input(data)
+		return inputLocked(data)
 	}
 }
 
@@ -125,12 +136,19 @@ func (s *lwipStack) RestartTimeouts() {
 // Note this function will not free objects allocated in lwIP initialization
 // stage, e.g. the loop interface.
 func (s *lwipStack) Close() error {
+	s.closeOnce.Do(s.close)
+	return nil
+}
+
+func (s *lwipStack) close() {
 	// Stop firing timer events.
 	s.cancel()
+	lwipMutex.Lock()
+	defer lwipMutex.Unlock()
 
 	// Abort and close all TCP and UDP connections.
 	tcpConns.Range(func(_, c interface{}) bool {
-		c.(*tcpConn).Abort()
+		c.(*tcpConn).abortLocked()
 		return true
 	})
 	udpConns.Range(func(_, c interface{}) bool {
@@ -138,19 +156,15 @@ func (s *lwipStack) Close() error {
 		// UDP connections in the handler will wait till
 		// timeout, they are not closed immediately for
 		// now.
-		c.(*udpConn).Close()
+		c.(*udpConn).closeLocked()
 		return true
 	})
 
 	// Remove callbacks and close listening pcbs.
-	lwipMutex.Lock()
 	C.tcp_accept(s.tpcb, nil)
 	C.udp_recv(s.upcb, nil, nil)
 	C.tcp_close(s.tpcb) // FIXME handle error
 	C.udp_remove(s.upcb)
-	lwipMutex.Unlock()
-
-	return nil
 }
 
 func init() {

@@ -17,7 +17,7 @@ func udpRecvFn(arg unsafe.Pointer, pcb *C.struct_udp_pcb, p *C.struct_pbuf, addr
 		}
 	}()
 
-	if pcb == nil {
+	if pcb == nil || p == nil {
 		return
 	}
 
@@ -45,7 +45,6 @@ func udpRecvFn(arg unsafe.Pointer, pcb *C.struct_udp_pcb, p *C.struct_pbuf, addr
 		if err != nil {
 			return
 		}
-		udpConns.Store(connId, conn)
 	}
 
 	var buf []byte

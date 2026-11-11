@@ -68,15 +68,23 @@ func fragOffset(ipv ipver, p []byte) uint16 {
 }
 
 func peekNextProto(ipv ipver, p []byte) (proto, error) {
+	if len(p) > 65535 {
+		return 0, errors.New("IP packet exceeds native buffer limit")
+	}
 	switch ipv {
 	case ipv4:
-		if len(p) < 9 {
-			return 0, errors.New("short IPv4 packet")
+		if len(p) < 20 {
+			return 0, errors.New("short IPv4 header")
+		}
+		headerLen := int(p[0]&15) * 4
+		totalLen := int(binary.BigEndian.Uint16(p[2:4]))
+		if headerLen < 20 || headerLen > len(p) || totalLen < headerLen || totalLen > len(p) {
+			return 0, errors.New("invalid IPv4 header length")
 		}
 		return proto(p[9]), nil
 	case ipv6:
-		if len(p) < 6 {
-			return 0, errors.New("short IPv6 packet")
+		if len(p) < 40 || int(binary.BigEndian.Uint16(p[4:6])) > len(p)-40 {
+			return 0, errors.New("short IPv6 header or payload")
 		}
 		return proto(p[6]), nil
 	default:
@@ -85,6 +93,12 @@ func peekNextProto(ipv ipver, p []byte) (proto, error) {
 }
 
 func input(pkt []byte) (int, error) {
+	lwipMutex.Lock()
+	defer lwipMutex.Unlock()
+	return inputLocked(pkt)
+}
+
+func inputLocked(pkt []byte) (int, error) {
 	if len(pkt) == 0 {
 		return 0, nil
 	}
@@ -99,9 +113,6 @@ func input(pkt []byte) (int, error) {
 		return 0, err
 	}
 
-	lwipMutex.Lock()
-	defer lwipMutex.Unlock()
-
 	var buf *C.struct_pbuf
 
 	if nextProto == proto_udp && !(moreFrags(ipv, pkt) || fragOffset(ipv, pkt) > 0) {
@@ -115,9 +126,18 @@ func input(pkt []byte) (int, error) {
 		// Allocating from PBUF_POOL results in a pbuf chain that may
 		// contain multiple pbufs.
 		buf = C.pbuf_alloc(C.PBUF_RAW, C.u16_t(len(pkt)), C.PBUF_POOL)
-		C.pbuf_take(buf, unsafe.Pointer(&pkt[0]), C.u16_t(len(pkt)))
+		if buf == nil {
+			return 0, errors.New("cannot allocate native packet buffer")
+		}
+		if C.pbuf_take(buf, unsafe.Pointer(&pkt[0]), C.u16_t(len(pkt))) != C.ERR_OK {
+			C.pbuf_free(buf)
+			return 0, errors.New("cannot copy packet into native buffer")
+		}
 	}
 
+	if buf == nil {
+		return 0, errors.New("cannot allocate native packet buffer")
+	}
 	ierr := C.input(buf)
 	if ierr != C.ERR_OK {
 		C.pbuf_free(buf)

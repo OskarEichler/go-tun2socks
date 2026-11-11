@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/hex"
 	"net"
-	"sync"
 	"testing"
 )
 
@@ -52,11 +51,8 @@ func setupUDP(t *testing.T) (LWIPStack, *fakeUDPHandler) {
 	fragPayload = append([]byte(nil), frag1[ipv4Header+udpHeader:]...)
 	fragPayload = append(fragPayload, frag2[ipv4Header:]...)
 
-	// Reset the set of known UDP connections to empty before each test.  Otherwise, the
-	// tests will interfere with each other.
-	udpConns = sync.Map{}
-
 	s := NewLWIPStack()
+	t.Cleanup(func() { s.Close(); waitUDPIdle(t) })
 	// This channel is buffered because the first Write->ReceiveTo can either be synchronous or
 	// asynchronous, depending on the results of a race during "connection".
 	h := &fakeUDPHandler{packets: make(chan []byte, 1)}
